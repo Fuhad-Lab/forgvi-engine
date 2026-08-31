@@ -1,0 +1,17 @@
+{
+  "name": "forgvi-engine",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Forgvi 2.0 — the goal-completion agent engine built on the prime-agent kernel (PrimeIntellect-ai/prime-agent fork)",
+  "engines": {
+    "node": ">=22.8.0"
+  },
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "prime-agent": "https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.8.1/prime-agent-0.8.1.tgz"
+  }
+}
