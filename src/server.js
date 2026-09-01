@@ -19,7 +19,7 @@ process.env.PI_OFFLINE ??= "1";
 process.env.PI_SKIP_VERSION_CHECK ??= "1";
 
 import express from "express";
-import { kernelModelId, kernelReady } from "./kernel.js";
+import { kernelModelId, kernelReady, requiredKeyEnv } from "./kernel.js";
 import { RunManager } from "./goal-loop.js";
 
 const PORT = Number(process.env.PORT ?? 8080);
@@ -74,7 +74,7 @@ app.get("/health", (_req, res) => {
 
 app.post("/runs", (req, res) => {
   if (!kernelReady()) {
-    res.status(503).json({ error: "engine kernel is not configured (missing NVIDIA_API_KEY)" });
+    res.status(503).json({ error: `engine kernel is not configured (missing ${requiredKeyEnv()})` });
     return;
   }
   const { objective, acceptance, budgets, workspaceGrant } = req.body ?? {};
@@ -187,7 +187,7 @@ app.use((error, _req, res, _next) => {
 
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`[forgvi] engine listening on :${PORT}`);
-  console.log(`[forgvi] kernel: ${kernelReady() ? `ready (${kernelModelId()})` : "NOT READY — set NVIDIA_API_KEY"}`);
+  console.log(`[forgvi] kernel: ${kernelReady() ? `ready (${kernelModelId()})` : `NOT READY — set ${requiredKeyEnv()}`}`);
 });
 
 const shutdown = () => {

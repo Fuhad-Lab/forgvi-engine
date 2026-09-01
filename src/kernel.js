@@ -3,9 +3,22 @@
  *
  * The kernel is prime-agent (PrimeIntellect-ai/prime-agent v0.8.1, forked
  * as the foundation of Forgvi 2.0). This module owns:
- *   - the provider registry (NVIDIA NIM via models.json, OpenAI-compatible)
+ *   - the provider registry (models.json, OpenAI-compatible providers —
+ *     NVIDIA NIM by default; aihubmix + aihubmix-alt available via env)
  *   - chief sessions (bash + edit tools)
  *   - judge sessions (no tools — the independent verifier)
+ *
+ * Provider selection is env-driven so switching providers never needs a
+ * code change or redeploy:
+ *   ENGINE_PROVIDER      "nvidia" (default) | "aihubmix" | "aihubmix-alt"
+ *   ENGINE_MODEL         override (defaults to the provider default below)
+ *   ENGINE_API_KEY       generic override (wins over the provider's own env)
+ *   NVIDIA_API_KEY       key for the nvidia provider
+ *   AIHUBMIX_API_KEY     key for the aihubmix / aihubmix-alt providers
+ *   AIHUBMIX_BASE_URL    optional: swap the aihubmix baseUrl at runtime
+ *
+ * aihubmix-alt points at the preferred mirror (api.inferera.com) for when
+ * the default aihubmix.com route is unreachable from the host network.
  *
  * Chief tool execution has two backends, chosen per run:
  *   - VM-bound (the default in production): the run carries a verified
@@ -38,7 +51,25 @@ const WORKSPACE_ROOT = process.env.ENGINE_WORKSPACE_ROOT
   ? resolve(process.env.ENGINE_WORKSPACE_ROOT)
   : resolve(ENGINE_DIR, "workspace");
 
-const MODEL_ID = process.env.ENGINE_MODEL ?? "nvidia/nemotron-3-super-120b-a12b";
+/**
+ * Provider table — one row per provider defined in .prime-agent/models.json.
+ *   keyEnv:      the env var the provider's API key lives in
+ *   defaultModel: used when ENGINE_MODEL is unset
+ */
+const PROVIDERS = {
+  nvidia: { keyEnv: "NVIDIA_API_KEY", defaultModel: "nvidia/nemotron-3-super-120b-a12b" },
+  aihubmix: { keyEnv: "AIHUBMIX_API_KEY", defaultModel: "coding-glm-5.3" },
+  "aihubmix-alt": { keyEnv: "AIHUBMIX_API_KEY", defaultModel: "coding-glm-5.3" },
+};
+
+const ENGINE_PROVIDER = (process.env.ENGINE_PROVIDER ?? "nvidia").toLowerCase();
+const PROVIDER = PROVIDERS[ENGINE_PROVIDER] ?? PROVIDERS.nvidia;
+const MODEL_ID = process.env.ENGINE_MODEL ?? PROVIDER.defaultModel;
+
+/** The env var a operator must set for the active provider (health msgs). */
+export function requiredKeyEnv() {
+  return PROVIDER.keyEnv;
+}
 
 let _auth = null;
 let _registry = null;
@@ -47,14 +78,21 @@ let _model = null;
 /** Lazy singletons for auth + model registry + resolved model. */
 function getModel() {
   if (_model) return _model;
-  const apiKey = process.env.NVIDIA_API_KEY;
+  const apiKey = process.env.ENGINE_API_KEY ?? process.env[PROVIDER.keyEnv];
   if (!apiKey) {
-    throw new Error("NVIDIA_API_KEY is not set — the engine cannot reach its model provider");
+    throw new Error(
+      `${PROVIDER.keyEnv} is not set — the engine cannot reach its ${ENGINE_PROVIDER} model provider`
+    );
   }
   _auth = AuthStorage.create(resolve(ENGINE_DIR, ".prime-agent", "auth.json"));
-  _auth.setRuntimeApiKey("nvidia", apiKey);
+  _auth.setRuntimeApiKey(ENGINE_PROVIDER, apiKey);
   _registry = ModelRegistry.create(_auth, MODELS_JSON);
-  _model = _registry.find("nvidia", MODEL_ID);
+  _model = _registry.find(ENGINE_PROVIDER, MODEL_ID);
+  if (!_model) {
+    throw new Error(
+      `model "${MODEL_ID}" is not defined for provider "${ENGINE_PROVIDER}" in .prime-agent/models.json`
+    );
+  }
   return _model;
 }
 
