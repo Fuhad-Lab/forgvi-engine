@@ -17,6 +17,7 @@
 import { randomUUID } from "node:crypto";
 import { Journal } from "./journal.js";
 import { createChiefSession, lastAssistantText } from "./kernel.js";
+import { verifyWorkspaceGrant } from "./grant.js";
 import { verifyAcceptance } from "./verify.js";
 
 /** Clamp helper. */
@@ -107,8 +108,15 @@ export class RunManager {
   /**
    * Create + start a run. Returns the run record immediately; the loop
    * continues in the background. Throws on validation/overload.
+   *
+   * `workspaceGrant` (optional) binds the run to a Daytona sandbox: a
+   * short-lived HMAC token minted by the Forge backend AFTER it verified the
+   * requesting user owns the project. A bad/expired/forged token is rejected
+   * with an honest 4xx — the run never silently falls back to the engine's
+   * local disk when the caller asked for the project workspace (that would
+   * split the workspace in two: the user's VM and a hidden engine copy).
    */
-  start({ objective, acceptance, budgets }) {
+  start({ objective, acceptance, budgets, workspaceGrant }) {
     const cleanObjective = String(objective ?? "").trim();
     const cleanAcceptance = (Array.isArray(acceptance) ? acceptance : [])
       .map((a) => String(a ?? "").trim())
@@ -120,6 +128,23 @@ export class RunManager {
 
     if (this.countActive() >= this.maxConcurrent) {
       throw new Error("engine at max concurrent runs — try again shortly");
+    }
+
+    // Workspace binding: verify the grant BEFORE the run exists. The token
+    // is optional (local dev), but when present it must be valid.
+    let workspace = null;
+    if (workspaceGrant != null && String(workspaceGrant).trim() !== "") {
+      const secret = process.env.WORKSPACE_GRANT_SECRET;
+      if (!secret) {
+        throw new Error("workspace grant rejected: WORKSPACE_GRANT_SECRET is not configured on the engine");
+      }
+      const claims = verifyWorkspaceGrant(String(workspaceGrant), { secret });
+      if (!claims) {
+        const error = new Error("workspace grant rejected: invalid or expired — reload the studio and send the request again");
+        error.validation = true;
+        throw error;
+      }
+      workspace = claims;
     }
 
     const runId = randomUUID();
@@ -134,6 +159,7 @@ export class RunManager {
       objective: cleanObjective,
       acceptance: cleanAcceptance,
       budgets: clamped,
+      workspace,
       status: "running",
       iteration: 0,
       startedAt: Date.now(),
@@ -197,6 +223,9 @@ export class RunManager {
       acceptance: run.acceptance,
       iteration: run.iteration,
       budgets: run.budgets,
+      workspace: run.workspace
+        ? { sandboxId: run.workspace.sandboxId, projectId: run.workspace.projectId, bound: true }
+        : { bound: false },
       startedAt: run.startedAt,
       finishedAt: run.finishedAt,
       report: run.report,
@@ -216,12 +245,42 @@ export class RunManager {
       {},
     );
 
-    const { session } = await createChiefSession({ runId: run.runId, sessionId: run.sessionId });
+    // Workspace binding is part of the run's public record: the studio
+    // shows the Files/Preview tabs from the VM, so it needs to know the run
+    // is VM-bound (and which sandbox) to refresh the tree live.
+    if (run.workspace) {
+      journal.emit(
+        {
+          type: "workspace_bound",
+          sandboxId: run.workspace.sandboxId,
+          projectId: run.workspace.projectId,
+          workspaceRoot: "/workspace",
+        },
+        {},
+      );
+    }
+
+    const { session, vm } = await createChiefSession({
+      runId: run.runId,
+      sessionId: run.sessionId,
+      workspace: run.workspace,
+    });
     run.chiefSession = session;
+
+    // Warm the daytona-service before the first chief command so a Render
+    // free-tier cold start doesn't burn the chief's first tool call. Best
+    // effort — the exec path retries on its own anyway.
+    if (vm) {
+      vm.client.ping().catch(() => {});
+    }
 
     // Track tool evidence from the kernel's own event stream:
     // tool_execution_start carries the args; tool_execution_end carries the
     // result + status. The judge sees commands AND their outputs.
+    //
+    // VM-bound runs ALSO journal each tool call (tool_used): the studio
+    // refreshes its Files-tab tree from the VM when it sees one, so 2.0
+    // artifacts appear live exactly like the 1.0 swarm's.
     const pendingArgs = new Map();
     const unsubTools = session.subscribe((event) => {
       if (event.type === "tool_execution_start") {
@@ -229,12 +288,24 @@ export class RunManager {
       } else if (event.type === "tool_execution_end") {
         const args = pendingArgs.get(event.toolCallId) ?? event.args;
         pendingArgs.delete(event.toolCallId);
-        run.evidence.push({
+        const evidence = {
           kind: "tool",
           name: `${event.toolName}: ${summarizeArgs(args)}`,
           status: event.isError ? "fail" : "pass",
           output: summarizeResult(event.result),
-        });
+        };
+        run.evidence.push(evidence);
+        if (run.workspace) {
+          journal.emit(
+            {
+              type: "tool_used",
+              tool: event.toolName,
+              status: evidence.status,
+              detail: evidence.name.slice(0, 200),
+            },
+            { role: "chief", iteration: run.iteration || undefined },
+          );
+        }
       }
     });
 
@@ -420,6 +491,29 @@ export class RunManager {
 
 /** First chief prompt: the contract. */
 function buildFirstPrompt(run) {
+  if (run.workspace) {
+    return [
+      "You are the chief agent of a Forgvi 2.0 run. You operate inside the",
+      "project's live workspace — a cloud VM mounted at /workspace. Every file",
+      "you create lands on that VM's real filesystem, and every command you",
+      "run executes on the VM. The workspace is shared: the studio's Files and",
+      "Preview tabs read this exact filesystem, and the project's other agents",
+      "(Forgvi 1.0) operate on it too — so keep it clean and build in place.",
+      "Existing files in /workspace may already hold earlier work; inspect them",
+      "first (ls, cat) and build on top rather than clobbering blindly.",
+      "",
+      "OBJECTIVE:",
+      run.objective,
+      "",
+      "ACCEPTANCE CRITERIA — an independent judge will verify each of these exactly as written:",
+      ...run.acceptance.map((a, i) => `${i + 1}. ${a}`),
+      "",
+      `You have at most ${run.budgets.maxIterations} iterations. Claims are not proof: the judge`,
+      "scores only what your tool evidence demonstrates. Work in /workspace, build the",
+      "artifacts, verify your own work with commands before you claim it, then end with a short",
+      "report: what you built, where it lives, and how each criterion is demonstrated.",
+    ].join("\n");
+  }
   return [
     "You are the chief agent of a Forgvi 2.0 run. You operate inside the engine's workspace:",
     "every file you create is a real artifact on disk, and every command you run is real.",

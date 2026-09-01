@@ -77,14 +77,23 @@ app.post("/runs", (req, res) => {
     res.status(503).json({ error: "engine kernel is not configured (missing NVIDIA_API_KEY)" });
     return;
   }
-  const { objective, acceptance, budgets } = req.body ?? {};
+  const { objective, acceptance, budgets, workspaceGrant } = req.body ?? {};
   try {
-    const run = manager.start({ objective, acceptance, budgets });
-    res.status(201).json({ runId: run.runId, goalId: run.goalId, status: run.status });
+    const run = manager.start({ objective, acceptance, budgets, workspaceGrant });
+    res.status(201).json({
+      runId: run.runId,
+      goalId: run.goalId,
+      status: run.status,
+      workspace: run.workspace
+        ? { sandboxId: run.workspace.sandboxId, projectId: run.workspace.projectId, bound: true }
+        : { bound: false },
+    });
   } catch (error) {
     const message = String(error?.message ?? error);
     const isValidation =
-      message.includes("acceptance criteria") || message.includes("objective is required");
+      message.includes("acceptance criteria") ||
+      message.includes("objective is required") ||
+      Boolean(error?.validation);
     res.status(isValidation ? 400 : 429).json({ error: message });
   }
 });
@@ -143,9 +152,27 @@ app.get("/runs/:id/events", (req, res) => {
     }
   }, 15_000);
 
+  // Terminal hygiene: when the journal closes, the client has the full
+  // replay + the forge-close frame — actually END the response so the
+  // EventSource fires onerror/onclose and every consumer (frontend poll
+  // fallback included) settles immediately instead of hanging on pings.
+  const closeWatcher = setInterval(() => {
+    if (run.journal.closed) {
+      clearInterval(closeWatcher);
+      clearInterval(heartbeat);
+      detach();
+      try {
+        res.end();
+      } catch {
+        /* already closed */
+      }
+    }
+  }, 1_000);
+
   const close = new Set(req.socket ? [req.socket] : []);
   req.on("close", () => {
     clearInterval(heartbeat);
+    clearInterval(closeWatcher);
     detach();
     close.clear();
   });
