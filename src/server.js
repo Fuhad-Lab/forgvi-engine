@@ -1,13 +1,15 @@
 /**
  * Forgvi Engine — HTTP server.
  *
- * The engine the Forge frontend talks to (NEXT_PUBLIC_FORGVI_ENGINE_URL):
+ * The engine the Forge frontend talks to (NEXT_PUBLIC_FORGVI_ENGINE_URL,
+ * or the in-VM engine's signed Daytona preview URL):
  *
  *   GET  /health                 liveness + kernel/model status
  *   POST /runs                   start a goal run {objective, acceptance, budgets}
  *   GET  /runs/:id               run state + completion report
  *   GET  /runs/:id/events        SSE — journal replay + live events
  *   POST /runs/:id/abort         abort a running goal
+ *   POST /runs/:id/answer        answer a pending ask_user question
  *   GET  /runs                   list runs (diagnostics)
  *
  * CORS: origin allowlist (the Forge site + local dev + Render previews).
@@ -166,6 +168,34 @@ app.post("/runs/:id/abort", (req, res) => {
   const reason = String(req.body?.reason ?? "user abort");
   const ok = manager.abort(req.params.id, reason);
   res.json({ ok, runId: run.runId, status: run.status, aborted: ok });
+});
+
+/** Answer a pending ask_user question (the studio's question card).
+ * The blocked chief tool resolves with the answer; the journal's
+ * question_resolved event locks every rendered card. Unknown ids settle
+ * honestly (400) — a stale card after a restart should not pretend. */
+app.post("/runs/:id/answer", (req, res) => {
+  const run = manager.get(req.params.id);
+  if (!run) {
+    res.status(404).json({ error: "run not found" });
+    return;
+  }
+  if (run.status !== "running") {
+    res.status(409).json({ error: "run is not running" });
+    return;
+  }
+  const questionId = String(req.body?.question_id ?? "").trim();
+  const answer = String(req.body?.answer ?? "").trim();
+  if (!questionId || !answer) {
+    res.status(400).json({ error: "question_id and answer are required" });
+    return;
+  }
+  const ok = run.interactions?.resolve(questionId, answer) ?? false;
+  if (!ok) {
+    res.status(400).json({ error: "unknown or already-answered question_id" });
+    return;
+  }
+  res.json({ ok: true, question_id: questionId });
 });
 
 /** SSE — journal replay + live events, heartbeat every 15s. */

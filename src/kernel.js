@@ -60,6 +60,12 @@ import {
   SettingsManager,
 } from "prime-agent";
 import { createVmWorkspace } from "./vm-operations.js";
+import {
+  createAskUserTool,
+  createGithubTool,
+  createRequestConnectorTool,
+  createSupabaseTool,
+} from "./connector-tools.js";
 
 /** True when the engine process itself runs INSIDE a Daytona sandbox. */
 export const ENGINE_IN_VM = process.env.ENGINE_IN_VM === "1";
@@ -163,7 +169,7 @@ export function kernelModelId() {
  * The session persists across iterations (the chief keeps its context); the
  * goal loop drives it turn by turn.
  */
-export async function createChiefSession({ runId, sessionId, workspace }) {
+export async function createChiefSession({ runId, sessionId, workspace, interactions }) {
   const model = getModel();
 
   if (ENGINE_IN_VM) {
@@ -179,7 +185,18 @@ export async function createChiefSession({ runId, sessionId, workspace }) {
         compaction: { enabled: false },
         enableBuiltinSkills: false,
       }),
-      customTools: [createBashTool(VM_WORKSPACE_ROOT), createEditTool(VM_WORKSPACE_ROOT)],
+      customTools: [
+        createBashTool(VM_WORKSPACE_ROOT),
+        createEditTool(VM_WORKSPACE_ROOT),
+        // GROUP 2 parity: the connector + interaction tools 1.0's swarm has.
+        // In-VM, the github/supabase/request_connector bridge is the 1.0
+        // orchestrator daemon on localhost (the tunnel keeps every token
+        // server-side); ask_user is engine-native (journal + answer route).
+        ...(interactions ? [createAskUserTool(interactions)] : []),
+        createGithubTool(),
+        createSupabaseTool(),
+        createRequestConnectorTool(),
+      ],
       sessionStartEvent: {
         type: "session_start",
         sessionId,
@@ -206,6 +223,13 @@ export async function createChiefSession({ runId, sessionId, workspace }) {
       customTools: [
         createBashTool(vm.workspaceRoot, { operations: vm.bashOperations }),
         createEditTool(vm.workspaceRoot, { operations: vm.editOperations }),
+        // GROUP 2 parity on the host engine too: ask_user always works;
+        // the connector tools degrade honestly (no localhost orchestrator
+        // from the engine host — the run's bridge is the VM's daemon).
+        ...(interactions ? [createAskUserTool(interactions)] : []),
+        createGithubTool(),
+        createSupabaseTool(),
+        createRequestConnectorTool(),
       ],
       tools: ["bash", "edit"],
       sessionStartEvent: {
@@ -231,7 +255,16 @@ export async function createChiefSession({ runId, sessionId, workspace }) {
       compaction: { enabled: false },
       enableBuiltinSkills: false,
     }),
-    customTools: [createBashTool(cwd), createEditTool(cwd)],
+    customTools: [
+      createBashTool(cwd),
+      createEditTool(cwd),
+      // Unbound local runs still get ask_user (engine-native); the
+      // connector tools report unavailability honestly.
+      ...(interactions ? [createAskUserTool(interactions)] : []),
+      createGithubTool(),
+      createSupabaseTool(),
+      createRequestConnectorTool(),
+    ],
     sessionStartEvent: {
       type: "session_start",
       sessionId,

@@ -19,6 +19,7 @@ import { readdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { Journal, recoverJournal } from "./journal.js";
 import { ENGINE_IN_VM, createChiefSession, lastAssistantText } from "./kernel.js";
+import { RunInteractions } from "./connector-tools.js";
 import { verifyWorkspaceGrant } from "./grant.js";
 import { verifyAcceptance } from "./verify.js";
 
@@ -298,6 +299,9 @@ export class RunManager {
       abortRequested: false,
       report: null,
       journal: new Journal(runId, sessionId, goalId, { persistDir: this.persistDir }),
+      /** ask_user registry — the journal carries questions to the studio,
+       * POST /runs/:id/answer resolves them (see server.js). */
+      interactions: new RunInteractions(journal),
       /** @type {Array<{kind: string, name: string, status: string}>} */
       evidence: [],
       lastChiefReport: "",
@@ -361,6 +365,11 @@ export class RunManager {
       finishedAt: run.finishedAt,
       report: run.report,
       eventCount: run.journal.seq,
+      // Unresolved ask_user questions (the studio re-renders their cards
+      // on remount without replaying the whole journal).
+      pendingQuestions: run.interactions
+        ? [...run.interactions.pending.keys()]
+        : [],
     };
   }
 
@@ -395,6 +404,7 @@ export class RunManager {
       runId: run.runId,
       sessionId: run.sessionId,
       workspace: run.workspace,
+      interactions: run.interactions,
     });
     run.chiefSession = session;
 
@@ -612,6 +622,9 @@ export class RunManager {
       {},
     );
     journal.close();
+    // Any ask_user still blocked? Unblock it honestly (the run is over —
+    // the tool resolves null and the loop's error guard settles the run).
+    run.interactions?.close();
 
     try {
       session.dispose();
@@ -653,6 +666,12 @@ function buildFirstPrompt(run) {
       "ACCEPTANCE CRITERIA — an independent judge will verify each of these exactly as written:",
       ...run.acceptance.map((a, i) => `${i + 1}. ${a}`),
       "",
+      "You can also: ask the user questions (ask_user) when a decision materially changes",
+      "what gets built; use their connected GitHub account (github) and their connected",
+      "Supabase database (supabase) when the build calls for real repositories or a real",
+      "database — request_connector asks them to connect an account that isn't yet. Prefer",
+      "asking over guessing, and prefer real services over fake stand-ins.",
+      "",
       `You have at most ${run.budgets.maxIterations} iterations. Claims are not proof: the judge`,
       "scores only what your tool evidence demonstrates. Work in /workspace, build the",
       "artifacts, verify your own work with commands before you claim it, then end with a short",
@@ -668,6 +687,9 @@ function buildFirstPrompt(run) {
     "",
     "ACCEPTANCE CRITERIA — an independent judge will verify each of these exactly as written:",
     ...run.acceptance.map((a, i) => `${i + 1}. ${a}`),
+    "",
+    "You can also: ask the user questions (ask_user) when a decision materially changes",
+    "what gets built. Prefer asking over guessing.",
     "",
     `You have at most ${run.budgets.maxIterations} iterations. Claims are not proof: the judge`,
     "scores only what your tool evidence demonstrates. Work in this workspace, build the",
