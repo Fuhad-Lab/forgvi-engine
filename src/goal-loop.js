@@ -15,8 +15,10 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { Journal } from "./journal.js";
-import { createChiefSession, lastAssistantText } from "./kernel.js";
+import { readdirSync } from "node:fs";
+import { resolve } from "node:path";
+import { Journal, recoverJournal } from "./journal.js";
+import { ENGINE_IN_VM, createChiefSession, lastAssistantText } from "./kernel.js";
 import { verifyWorkspaceGrant } from "./grant.js";
 import { verifyAcceptance } from "./verify.js";
 
@@ -97,12 +99,121 @@ function normalizeBudgets(budgets) {
 
 /**
  * RunManager — the registry of live runs.
+ *
+ * PERSISTENCE (in-VM mode): when ENGINE_PERSIST_DIR is set, the manager
+ * scans it at construction and rebuilds every run recorded on disk — the
+ * same disk the journal appends to, so a PM2 restart (crash, OOM, VM
+ * stop/start) never loses history. Finished runs replay exactly as they
+ * ended; interrupted runs get ONE honest terminal event appended
+ * (run_finished status "incomplete", reason "engine restarted") so every
+ * re-attaching frontend settles immediately instead of hanging on a run
+ * that no longer exists. The host (Render) engine has no persist dir and
+ * keeps its in-memory-only behavior.
  */
 export class RunManager {
-  constructor({ maxConcurrent = Number(process.env.ENGINE_MAX_CONCURRENT ?? 3) } = {}) {
-    this.maxConcurrent = maxConcurrent;
+  constructor({
+    maxConcurrent = Number(process.env.ENGINE_MAX_CONCURRENT ?? 3),
+    persistDir = process.env.ENGINE_PERSIST_DIR ?? null,
+  } = {}) {
+    this.maxConcurrent = Math.max(1, Math.floor(maxConcurrent));
+    this.persistDir = persistDir ? resolve(persistDir) : null;
     /** @type {Map<string, any>} */
     this.runs = new Map();
+    if (this.persistDir) {
+      try {
+        this.#recoverPersistedRuns();
+      } catch (error) {
+        console.warn("[forgvi] run recovery failed:", error?.message ?? error);
+      }
+    }
+  }
+
+  /** Boot recovery: rebuild runs from <persistDir>/<runId>.ndjson files. */
+  #recoverPersistedRuns() {
+    const files = readdirSync(this.persistDir)
+      .filter((f) => f.endsWith(".ndjson"))
+      .sort();
+    let recovered = 0;
+    let finalized = 0;
+    for (const file of files) {
+      const runId = file.slice(0, -".ndjson".length);
+      if (this.runs.has(runId)) continue;
+      const rec = recoverJournal(runId, `recovered-${runId.slice(0, 8)}`, runId, this.persistDir);
+      if (!rec) continue;
+      const first = rec.journal.entries.find((e) => e.event?.type === "run_started");
+      const run = {
+        runId,
+        sessionId: `recovered-${runId.slice(0, 8)}`,
+        goalId: runId,
+        objective: first?.event?.objective ?? "(recovered run)",
+        acceptance: first?.event?.acceptance ?? [],
+        budgets: first?.event?.budgets ?? normalizeBudgets(null),
+        workspace: recoveredWorkspace(runId),
+        status: "incomplete",
+        iteration: rec.journal.entries.at(-1)?.iteration ?? 0,
+        startedAt: rec.journal.entries[0]?.ts ?? Date.now(),
+        finishedAt: rec.lastFinish?.ts ?? Date.now(),
+        abortRequested: false,
+        report: null,
+        journal: rec.journal,
+        evidence: [],
+        lastChiefReport: "",
+        promise: null,
+        recovered: true,
+      };
+      if (rec.finished) {
+        const status = String(rec.lastFinish?.event?.status ?? "incomplete");
+        run.status = status === "complete" ? "complete" : "incomplete";
+        run.finishedAt = rec.lastFinish?.ts ?? Date.now();
+        run.report = {
+          goalId: run.goalId,
+          runId,
+          status: run.status,
+          summary: String(rec.lastFinish?.event?.summary ?? ""),
+          verificationScore: Number(rec.lastFinish?.event?.verificationScore ?? 0),
+          remainingIssues: (rec.lastFinish?.event?.remainingIssues ?? []),
+          iterations: Number(rec.lastFinish?.event?.iterations ?? 0),
+          durationMs: Number(rec.lastFinish?.event?.durationMs ?? 0),
+          evidence: [],
+        };
+        recovered += 1;
+      } else {
+        // Interrupted mid-flight (crash / restart / VM stop): append the
+        // ONE honest terminal event the contract promises, then close.
+        run.report = {
+          goalId: run.goalId,
+          runId,
+          status: "incomplete",
+          summary: "The engine restarted while this run was in flight. Everything built so far is saved in the workspace — check the Files tab.",
+          verificationScore: 0,
+          remainingIssues: ["run interrupted by engine restart"],
+          iterations: run.iteration,
+          durationMs: run.finishedAt - run.startedAt,
+          evidence: [],
+        };
+        run.journal.emit(
+          {
+            type: "run_finished",
+            status: "incomplete",
+            summary: run.report.summary,
+            verificationScore: 0,
+            iterations: run.iteration,
+            durationMs: run.report.durationMs,
+            remainingIssues: run.report.remainingIssues,
+            interrupted: true,
+          },
+          {},
+        );
+        run.journal.close();
+        finalized += 1;
+      }
+      this.runs.set(runId, run);
+    }
+    if (files.length > 0) {
+      console.log(
+        `[forgvi] run recovery: ${recovered} finished + ${finalized} finalized (interrupted) from ${this.persistDir}`,
+      );
+    }
   }
 
   /**
@@ -130,10 +241,30 @@ export class RunManager {
       throw new Error("engine at max concurrent runs — try again shortly");
     }
 
-    // Workspace binding: verify the grant BEFORE the run exists. The token
-    // is optional (local dev), but when present it must be valid.
+    // Workspace binding, per mode:
+    //
+    // IN-VM: the engine process itself lives inside the project's Daytona
+    // sandbox, so the run is bound to THIS VM by construction (sandbox id
+    // + project id come from the installer's env). The grant is neither
+    // required nor verified here — reachability is already capability-
+    // gated upstream (only the backend's ownership-checked agent-info
+    // brokers the engine's signed preview URL to the project's owner, and
+    // the engine can only ever touch its own VM).
+    //
+    // HOST (Render): the grant path is the trust boundary. The token is
+    // optional (local dev), but when present it must be valid — a run
+    // asked for the project workspace must never silently fall back to
+    // the engine's local disk (that would split the workspace in two:
+    // the user's VM and a hidden engine copy).
     let workspace = null;
-    if (workspaceGrant != null && String(workspaceGrant).trim() !== "") {
+    if (ENGINE_IN_VM) {
+      workspace = {
+        sandboxId: process.env.ENGINE_SANDBOX_ID || "this-vm",
+        projectId: process.env.ENGINE_PROJECT_ID || null,
+        userId: null,
+        local: true,
+      };
+    } else if (workspaceGrant != null && String(workspaceGrant).trim() !== "") {
       const secret = process.env.WORKSPACE_GRANT_SECRET;
       if (!secret) {
         throw new Error("workspace grant rejected: WORKSPACE_GRANT_SECRET is not configured on the engine");
@@ -166,7 +297,7 @@ export class RunManager {
       finishedAt: null,
       abortRequested: false,
       report: null,
-      journal: new Journal(runId, sessionId, goalId),
+      journal: new Journal(runId, sessionId, goalId, { persistDir: this.persistDir }),
       /** @type {Array<{kind: string, name: string, status: string}>} */
       evidence: [],
       lastChiefReport: "",
@@ -269,7 +400,8 @@ export class RunManager {
 
     // Warm the daytona-service before the first chief command so a Render
     // free-tier cold start doesn't burn the chief's first tool call. Best
-    // effort — the exec path retries on its own anyway.
+    // effort — the exec path retries on its own anyway. (In-VM runs have no
+    // REST hop to warm — the tools execute natively in this VM.)
     if (vm) {
       vm.client.ping().catch(() => {});
     }
@@ -487,6 +619,19 @@ export class RunManager {
       /* best effort */
     }
   }
+}
+
+/** Workspace shown for a recovered run (in-VM runs recovered from disk). */
+function recoveredWorkspace(runId) {
+  if (ENGINE_IN_VM) {
+    return {
+      sandboxId: process.env.ENGINE_SANDBOX_ID || "this-vm",
+      projectId: process.env.ENGINE_PROJECT_ID || null,
+      userId: null,
+      local: true,
+    };
+  }
+  return null;
 }
 
 /** First chief prompt: the contract. */

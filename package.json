@@ -8,10 +8,16 @@
     "node": ">=22.8.0"
   },
   "scripts": {
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "vendor": "node scripts/vendor.mjs"
   },
   "dependencies": {
     "express": "^4.21.2",
     "prime-agent": "https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.8.1/prime-agent-0.8.1.tgz"
+  },
+  "overrides": {
+    "@earendil-works/pi-agent-core": "file:vendor/prime-agent-core-0.8.1.tgz",
+    "@earendil-works/pi-ai": "file:vendor/prime-agent-ai-0.8.1.tgz",
+    "@earendil-works/pi-tui": "file:vendor/prime-agent-tui-0.8.1.tgz"
   }
 }

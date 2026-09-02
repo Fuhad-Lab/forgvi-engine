@@ -11,6 +11,7 @@
  * Provider selection is env-driven so switching providers never needs a
  * code change or redeploy:
  *   ENGINE_PROVIDER      "nvidia" (default) | "aihubmix" | "aihubmix-alt"
+ *                         | "vm-tunnel" (the in-VM mode — see ENGINE_IN_VM)
  *   ENGINE_MODEL         override (defaults to the provider default below)
  *   ENGINE_API_KEY       generic override (wins over the provider's own env)
  *   NVIDIA_API_KEY       key for the nvidia provider
@@ -20,12 +21,27 @@
  * aihubmix-alt points at the preferred mirror (api.inferera.com) for when
  * the default aihubmix.com route is unreachable from the host network.
  *
- * Chief tool execution has two backends, chosen per run:
- *   - VM-bound (the default in production): the run carries a verified
- *     workspace grant, and bash/edit operate directly on the project's
- *     Daytona sandbox through the daytona-service — the SAME /workspace
- *     filesystem Forgvi 1.0's in-VM swarm uses. The VM IS the workspace;
- *     nothing is built on the engine host.
+ * IN-VM MODE (ENGINE_IN_VM=1) — "the engine lives inside the Daytona
+ * sandbox", exactly like Forgvi 1.0's orchestrator:
+ *   - The engine process runs inside the project's VM (PM2-supervised by
+ *     the sidecar installer, port 8799, journal on the VM's disk).
+ *   - The chief's bash/edit tools execute LOCALLY inside the VM, rooted
+ *     at ENGINE_VM_WORKSPACE_ROOT (/workspace) — no REST round-trips, no
+ *     engine-host disk, the VM IS the workspace by construction.
+ *   - LLM calls go to the "vm-tunnel" provider: the 1.0 orchestrator
+ *     daemon (localhost:9000) proxies them through its /reverse-tunnel
+ *     WebSocket to the ArcForge backend, which injects the NVIDIA key
+ *     server-side. The key NEVER enters the VM (the EU egress filter
+ *     blocks *.nvidia.com anyway — the tunnel is the only way out).
+ *   - The workspace grant is not required: the engine can only be reached
+ *     through the SIGNED Daytona preview URL the backend brokers to the
+ *     project's owner, and it can only affect its own VM.
+ *
+ * Chief tool execution has two other backends, chosen per run:
+ *   - VM-bound via REST (the host-engine default in production): the run
+ *     carries a verified workspace grant, and bash/edit operate on the
+ *     project's Daytona sandbox through the daytona-service — the SAME
+ *     /workspace filesystem Forgvi 1.0's in-VM swarm uses.
  *   - local fallback (dev / unbound runs): a per-run directory on disk.
  *
  * The rest of the engine NEVER talks to an LLM directly; everything goes
@@ -45,6 +61,12 @@ import {
 } from "prime-agent";
 import { createVmWorkspace } from "./vm-operations.js";
 
+/** True when the engine process itself runs INSIDE a Daytona sandbox. */
+export const ENGINE_IN_VM = process.env.ENGINE_IN_VM === "1";
+
+/** Root the chief's tools at when running inside the VM. */
+const VM_WORKSPACE_ROOT = process.env.ENGINE_VM_WORKSPACE_ROOT ?? "/workspace";
+
 const ENGINE_DIR = resolve(new URL("..", import.meta.url).pathname);
 const MODELS_JSON = resolve(ENGINE_DIR, ".prime-agent", "models.json");
 const WORKSPACE_ROOT = process.env.ENGINE_WORKSPACE_ROOT
@@ -60,6 +82,11 @@ const PROVIDERS = {
   nvidia: { keyEnv: "NVIDIA_API_KEY", defaultModel: "nvidia/nemotron-3-super-120b-a12b" },
   aihubmix: { keyEnv: "AIHUBMIX_API_KEY", defaultModel: "coding-glm-5.3" },
   "aihubmix-alt": { keyEnv: "AIHUBMIX_API_KEY", defaultModel: "coding-glm-5.3" },
+  // The in-VM provider: the 1.0 orchestrator daemon (localhost:9000)
+  // proxies OpenAI-format requests through its reverse tunnel. The "key"
+  // is the VM's own ORCH_TOKEN (a per-VM secret the proxy validates on
+  // localhost) — never a provider key, which stays on the backend.
+  "vm-tunnel": { keyEnv: "ENGINE_LLM_TOKEN", defaultModel: "nvidia/nemotron-3-super-120b-a12b" },
 };
 
 const ENGINE_PROVIDER = (process.env.ENGINE_PROVIDER ?? "nvidia").toLowerCase();
@@ -119,23 +146,49 @@ export function kernelModelId() {
 /**
  * Chief session — the primary agent of a run.
  *
- * When `workspace` (a verified workspace grant's claims) is provided, the
- * bash + edit tools execute against the project's Daytona sandbox: the
- * session's cwd is the VM's /workspace, commands run inside the VM, and
- * edits write into it — the exact filesystem Forgvi 1.0 and the studio's
- * Files/Preview tabs operate on. The local disk is never touched.
+ * Three backends, chosen by mode:
  *
- * The tool allowlist ("bash" + "edit") matters: without it prime-agent
- * also activates its built-in ipython tool, which would run a LOCAL python
- * kernel and silently diverge from the VM workspace.
+ *  1. IN-VM (ENGINE_IN_VM=1): the engine process runs inside the project's
+ *     Daytona sandbox, so the chief's bash + edit tools execute NATIVELY in
+ *     the VM, rooted at /workspace — the same filesystem Forgvi 1.0, the
+ *     studio's Files/Preview tabs, and the terminal all use. No REST
+ *     round-trips, nothing on any engine host. The tool allowlist
+ *     ("bash" + "edit") keeps prime-agent's local ipython tool off.
  *
- * Without a workspace, the legacy local-disk backend is used (per-run
- * directory under ENGINE_WORKSPACE_ROOT) — dev runs and unbound fallbacks.
+ *  2. VM-bound via REST (host engine + verified workspace grant): bash/edit
+ *     operate on the project's Daytona sandbox through the daytona-service.
+ *
+ *  3. local fallback (dev / unbound host runs): a per-run directory on disk.
+ *
  * The session persists across iterations (the chief keeps its context); the
  * goal loop drives it turn by turn.
  */
 export async function createChiefSession({ runId, sessionId, workspace }) {
   const model = getModel();
+
+  if (ENGINE_IN_VM) {
+    mkdirSync(VM_WORKSPACE_ROOT, { recursive: true });
+    const { session } = await createAgentSession({
+      model,
+      thinkingLevel: "off",
+      authStorage: _auth,
+      modelRegistry: _registry,
+      cwd: VM_WORKSPACE_ROOT,
+      sessionManager: SessionManager.inMemory(),
+      settingsManager: SettingsManager.inMemory({
+        compaction: { enabled: false },
+        enableBuiltinSkills: false,
+      }),
+      customTools: [createBashTool(VM_WORKSPACE_ROOT), createEditTool(VM_WORKSPACE_ROOT)],
+      sessionStartEvent: {
+        type: "session_start",
+        sessionId,
+        source: "forgvi-engine-vm",
+        objective: undefined,
+      },
+    });
+    return { session, cwd: VM_WORKSPACE_ROOT, vm: null, inVm: true };
+  }
 
   if (workspace?.sandboxId) {
     const vm = createVmWorkspace(workspace);

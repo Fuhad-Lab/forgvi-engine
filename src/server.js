@@ -19,10 +19,18 @@ process.env.PI_OFFLINE ??= "1";
 process.env.PI_SKIP_VERSION_CHECK ??= "1";
 
 import express from "express";
-import { kernelModelId, kernelReady, requiredKeyEnv } from "./kernel.js";
+import { unlinkSync, existsSync, writeFileSync } from "node:fs";
+import { kernelModelId, kernelReady, requiredKeyEnv, ENGINE_IN_VM } from "./kernel.js";
 import { RunManager } from "./goal-loop.js";
 
 const PORT = Number(process.env.PORT ?? 8080);
+const PERSIST_DIR = process.env.ENGINE_PERSIST_DIR ?? null;
+
+/** Heartbeat file the 1.0 orchestrator reads to report engine_busy on
+ * /status (which the backend's tunnel sweeper uses to keep the reverse
+ * tunnel alive while an in-VM run works). Touched every 10s while any run
+ * is active; removed when the engine goes idle. */
+const BUSY_FILE = process.env.ENGINE_BUSY_FILE ?? null;
 const ALLOWED_ORIGINS = new Set(
   [
     "https://forgeyn.com.ng",
@@ -58,6 +66,37 @@ app.use((req, res, next) => {
 
 const manager = new RunManager();
 
+// ── Busy heartbeat (in-VM mode) ──────────────────────────────────────────
+// While any run is active, keep the heartbeat file fresh so the VM's
+// orchestrator daemon (and through it the backend's tunnel sweeper) knows
+// the engine is mid-run and must keep the LLM reverse tunnel connected.
+// Touch = write a tiny stamp (utimes cannot create a missing file).
+if (BUSY_FILE) {
+  const stampBusy = () => {
+    try {
+      writeFileSync(BUSY_FILE, String(Date.now()), "utf8");
+    } catch {
+      /* heartbeat must never kill the engine */
+    }
+  };
+  const clearBusy = () => {
+    try {
+      if (existsSync(BUSY_FILE)) unlinkSync(BUSY_FILE);
+    } catch {
+      /* best-effort */
+    }
+  };
+  setInterval(() => {
+    if (manager.countActive() > 0) stampBusy();
+    else clearBusy();
+  }, 10_000).unref?.();
+  // Set the initial state immediately (an engine booted mid-run after PM2
+  // restart counts as busy — its recovered runs already finished honestly,
+  // so idle is the correct initial state; the interval takes over from here).
+  if (manager.countActive() > 0) stampBusy();
+  else clearBusy();
+}
+
 app.get("/health", (_req, res) => {
   const ready = kernelReady();
   res.status(ready ? 200 : 503).json({
@@ -67,6 +106,11 @@ app.get("/health", (_req, res) => {
     version: "1.0.0",
     kernel: "prime-agent@0.8.1",
     model: kernelModelId(),
+    // Where this engine process lives — "in-vm" (inside the project's
+    // Daytona sandbox, tools native, journal on VM disk) or "host" (the
+    // Render deployment, VM-bound via REST grants).
+    mode: ENGINE_IN_VM ? "in-vm" : "host",
+    persisted: Boolean(PERSIST_DIR),
     activeRuns: manager.countActive(),
     totalRuns: manager.runs.size,
   });
@@ -186,7 +230,7 @@ app.use((error, _req, res, _next) => {
 });
 
 const server = app.listen(PORT, "0.0.0.0", () => {
-  console.log(`[forgvi] engine listening on :${PORT}`);
+  console.log(`[forgvi] engine listening on :${PORT} (mode=${ENGINE_IN_VM ? "in-vm" : "host"}${PERSIST_DIR ? ", journal persisted" : ""})`);
   console.log(`[forgvi] kernel: ${kernelReady() ? `ready (${kernelModelId()})` : `NOT READY — set ${requiredKeyEnv()}`}`);
 });
 
