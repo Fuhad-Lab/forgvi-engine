@@ -66,6 +66,28 @@ import {
   createRequestConnectorTool,
   createSupabaseTool,
 } from "./connector-tools.js";
+import { buildChiefTools } from "./tools.js";
+
+/**
+ * The chief's tool allowlist — bash + edit (the core workspace tools) plus
+ * the Vube surface: ask_user, connector tools, orchestrate, scaffold_vube,
+ * list_nodes. Without an allowlist prime-agent would also activate its
+ * built-in ipython tool, which would run a LOCAL python kernel and silently
+ * diverge from the VM workspace (the in-VM branch deliberately omits the
+ * allowlist — there the engine lives inside the VM and prime-agent's own
+ * tool defaults are acceptable).
+ */
+const CHIEF_TOOLS = [
+  "bash",
+  "edit",
+  "ask_user",
+  "github",
+  "supabase",
+  "request_connector",
+  "orchestrate",
+  "scaffold_vube",
+  "list_nodes",
+];
 
 /** True when the engine process itself runs INSIDE a Daytona sandbox. */
 export const ENGINE_IN_VM = process.env.ENGINE_IN_VM === "1";
@@ -169,11 +191,15 @@ export function kernelModelId() {
  * The session persists across iterations (the chief keeps its context); the
  * goal loop drives it turn by turn.
  */
-export async function createChiefSession({ runId, sessionId, workspace, interactions }) {
+export async function createChiefSession({ runId, sessionId, workspace, interactions, runCtx = {} }) {
   const model = getModel();
 
   if (ENGINE_IN_VM) {
     mkdirSync(VM_WORKSPACE_ROOT, { recursive: true });
+    // The Vube tools read ctx.vm at CALL time — the in-VM engine has no REST
+    // VM client; the workspace IS this process's filesystem.
+    runCtx.localCwd = VM_WORKSPACE_ROOT;
+    const vube = buildChiefTools(runCtx);
     const { session } = await createAgentSession({
       model,
       thinkingLevel: "off",
@@ -196,6 +222,11 @@ export async function createChiefSession({ runId, sessionId, workspace, interact
         createGithubTool(),
         createSupabaseTool(),
         createRequestConnectorTool(),
+        // The Vube surface: dynamic orchestration + monorepo scaffold +
+        // registry discovery.
+        vube.orchestrate,
+        vube.scaffoldVube,
+        vube.listNodes,
       ],
       sessionStartEvent: {
         type: "session_start",
@@ -209,6 +240,10 @@ export async function createChiefSession({ runId, sessionId, workspace, interact
 
   if (workspace?.sandboxId) {
     const vm = createVmWorkspace(workspace);
+    // The chief's tools read ctx.vm at CALL time — assign once resolved.
+    runCtx.vm = vm;
+    runCtx.localCwd = null;
+    const vube = buildChiefTools(runCtx);
     const { session } = await createAgentSession({
       model,
       thinkingLevel: "off",
@@ -223,15 +258,20 @@ export async function createChiefSession({ runId, sessionId, workspace, interact
       customTools: [
         createBashTool(vm.workspaceRoot, { operations: vm.bashOperations }),
         createEditTool(vm.workspaceRoot, { operations: vm.editOperations }),
-        // GROUP 2 parity on the host engine too: ask_user always works;
-        // the connector tools degrade honestly (no localhost orchestrator
-        // from the engine host — the run's bridge is the VM's daemon).
+        // ask_user (engine-native) + request_connector (honest on host).
         ...(interactions ? [createAskUserTool(interactions)] : []),
-        createGithubTool(),
-        createSupabaseTool(),
         createRequestConnectorTool(),
+        // Host mode: github + supabase run DIRECT against the engine's own
+        // tokens (GITHUB_TOKEN / SUPABASE_*) — functional today; the
+        // tunnel-bridged per-user versions live in the in-VM branch.
+        vube.github,
+        vube.supabase,
+        // The Vube surface.
+        vube.orchestrate,
+        vube.scaffoldVube,
+        vube.listNodes,
       ],
-      tools: ["bash", "edit"],
+      tools: CHIEF_TOOLS,
       sessionStartEvent: {
         type: "session_start",
         sessionId,
@@ -244,6 +284,8 @@ export async function createChiefSession({ runId, sessionId, workspace, interact
 
   const cwd = resolve(WORKSPACE_ROOT, runId);
   mkdirSync(cwd, { recursive: true });
+  runCtx.localCwd = cwd;
+  const vube = buildChiefTools(runCtx);
   const { session } = await createAgentSession({
     model,
     thinkingLevel: "off",
@@ -261,10 +303,14 @@ export async function createChiefSession({ runId, sessionId, workspace, interact
       // Unbound local runs still get ask_user (engine-native); the
       // connector tools report unavailability honestly.
       ...(interactions ? [createAskUserTool(interactions)] : []),
-      createGithubTool(),
-      createSupabaseTool(),
       createRequestConnectorTool(),
+      vube.github,
+      vube.supabase,
+      vube.orchestrate,
+      vube.scaffoldVube,
+      vube.listNodes,
     ],
+    tools: CHIEF_TOOLS,
     sessionStartEvent: {
       type: "session_start",
       sessionId,
@@ -273,6 +319,32 @@ export async function createChiefSession({ runId, sessionId, workspace, interact
     },
   });
   return { session, cwd, vm: null };
+}
+
+/**
+ * Specialist (rlm-style subagent) session — the advisor the chief spawns
+ * through orchestrate. Tool-less by design: specialists return specs,
+ * code, and checklists; the CHIEF applies them so every artifact carries
+ * tool evidence the judge can verify (and concurrent specialists never
+ * race the shared workspace). The persona system prompt is composed into
+ * the first prompt by orchestrator-utils (spawnSpecialistAgent).
+ */
+export async function createSpecialistSession() {
+  const model = getModel();
+  const { session } = await createAgentSession({
+    model,
+    thinkingLevel: "off",
+    authStorage: _auth,
+    modelRegistry: _registry,
+    cwd: ENGINE_DIR,
+    sessionManager: SessionManager.inMemory(),
+    settingsManager: SettingsManager.inMemory({
+      compaction: { enabled: false },
+      enableBuiltinSkills: false,
+    }),
+    noTools: "all",
+  });
+  return { session, lastAssistantText: () => lastAssistantText(session) };
 }
 
 /**

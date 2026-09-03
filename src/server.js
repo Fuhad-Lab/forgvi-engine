@@ -24,6 +24,9 @@ import express from "express";
 import { unlinkSync, existsSync, writeFileSync } from "node:fs";
 import { kernelModelId, kernelReady, requiredKeyEnv, ENGINE_IN_VM } from "./kernel.js";
 import { RunManager } from "./goal-loop.js";
+import { listPersonas, loadPersonas, G } from "./personas.js";
+import { describeCatalog, registrySize } from "./registry.js";
+import "./nodes.js"; // registers the capability graph at boot
 
 const PORT = Number(process.env.PORT ?? 8080);
 const PERSIST_DIR = process.env.ENGINE_PERSIST_DIR ?? null;
@@ -151,7 +154,28 @@ app.get("/health", (_req, res) => {
     persisted: Boolean(PERSIST_DIR),
     activeRuns: manager.countActive(),
     totalRuns: manager.runs.size,
+    personas: G.prompts.size,
+    registryNodes: registrySize(),
   });
+});
+
+/** Persona roster (Vube pillar 4 — dynamic profiles from .prime/prompts/). */
+app.get("/personas", (_req, res) => {
+  res.json({
+    dir: G.promptsDir,
+    personas: listPersonas(),
+  });
+});
+
+/** Reload personas from disk (edit .prime/prompts/*.md → no redeploy). */
+app.post("/personas/reload", (_req, res) => {
+  const count = loadPersonas();
+  res.json({ ok: true, loaded: count, dir: G.promptsDir });
+});
+
+/** Capability registry catalog (Vube pillar 3 — discoverable nodes). */
+app.get("/nodes", (req, res) => {
+  res.type("text/plain").send(describeCatalog({ kind: req.query.kind }));
 });
 
 app.post("/runs", (req, res) => {
@@ -298,7 +322,35 @@ app.use((error, _req, res, _next) => {
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`[forgvi] engine listening on :${PORT} (mode=${ENGINE_IN_VM ? "in-vm" : "host"}${PERSIST_DIR ? ", journal persisted" : ""})`);
   console.log(`[forgvi] kernel: ${kernelReady() ? `ready (${kernelModelId()})` : `NOT READY — set ${requiredKeyEnv()}`}`);
+  console.log(`[forgvi] personas: ${G.prompts.size} loaded from ${G.promptsDir}`);
+  console.log(`[forgvi] registry: ${registrySize()} nodes`);
+  startKeepAlive();
 });
+
+/**
+ * Render free-tier spin-down guard (incident 2026-09-03, same as the
+ * daytona service): free web services sleep after 15 min without inbound
+ * traffic; the cold start can outlast external monitor timeouts (Uptime
+ * Robot's default 30s) which then report "can't be reached". Self-ping
+ * the PUBLIC health endpoint (Render injects RENDER_EXTERNAL_URL) every
+ * 10 minutes so the idle timer never expires. No-ops locally.
+ */
+function startKeepAlive() {
+  const base = (process.env.RENDER_EXTERNAL_URL ?? "").replace(/\/+$/, "");
+  const enabled = (process.env.KEEPALIVE_ENABLED ?? "1") !== "0";
+  if (!enabled || !base) return;
+  const intervalMs = Number(process.env.KEEPALIVE_INTERVAL_SECONDS ?? 600) * 1000;
+  const ping = async () => {
+    try {
+      const res = await fetch(`${base}/health`, { signal: AbortSignal.timeout(60_000) });
+      console.log(`[forgvi] keep-alive ping -> ${res.status}`);
+    } catch (error) {
+      console.warn(`[forgvi] keep-alive ping failed (will retry): ${error?.message ?? error}`);
+    }
+  };
+  setTimeout(ping, 30_000).unref();
+  setInterval(ping, intervalMs).unref();
+}
 
 const shutdown = () => {
   console.log("[forgvi] shutting down");

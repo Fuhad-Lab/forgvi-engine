@@ -62,3 +62,66 @@ The model provider is configured in `.prime-agent/models.json` (OpenAI-compatibl
 - Provider: `packages/ai` openai-completions API against NVIDIA NIM.
 - Chief sessions: bash + edit tools in a per-run workspace (`workspace/<runId>/`) — artifacts are real files.
 - Judge sessions: tool-less, fresh per verification turn — verdicts never anchor on the chief's reasoning.
+
+## The Vube surface (2.1 — 2026-09)
+
+The engine now carries the Vube platform spec end-to-end:
+
+**Dynamic persona management (pillar 4)** — agent system prompts live as
+markdown profiles in `.prime/prompts/` (chief_orchestrator, frontend_expert,
+logic_architect, visual_specialist, backend_engineer, qa_verifier,
+research_analyst), loaded into harness memory (`G.prompts`) at boot and
+hot-reloaded on edit. `GET /personas` lists them; `POST /personas/reload`
+forces a rescan; the chief's briefing embeds the live roster.
+
+**Dynamic orchestration (pillar 3, the Replit pattern)** — the chief's
+`orchestrate` tool spawns 1-5 specialist subagents concurrently
+(`Promise.all` = `asyncio.gather`), each running its persona prompt in a
+fresh tool-less session (the rlm equivalent). No hardcoded graphs: the
+chief writes the dispatch plan per iteration. Every run also persists its
+full step history to an append-only JSONL (`ENGINE_JOURNAL_DIR/<runId>.jsonl`),
+and agents exchange direct messages through the nuclear-family mailbox
+(`agent_message` events; cross-run chatter is rejected).
+
+**The universal node registry (pillar 3)** — every capability (persona
+spawn, dispatch, GitHub, Supabase, scaffold, VM exec) registers with a
+dynamic runtime schema in `src/registry.js`; `GET /nodes` prints the
+catalog; the chief's `list_nodes` tool discovers it live.
+
+**The Vube monorepo scaffold (pillars 1 + 2)** — `scaffold_vube` writes
+the platform monorepo into the workspace: apps/web-client (Next.js with
+the full pre-installed premium stack: Tailwind, shadcn/ui, Motion, Magic
+UI, Aceternity, HeroUI, Lenis, GSAP, React Three Fiber, Radix, Lucide,
+Sonner, Vaul, Embla, TanStack Query, Zustand, React Hook Form, Zod),
+apps/api-server, apps/execution-engine, packages/vube-types,
+packages/vube-ui, infrastructure.
+
+**MCP parity with Forgvi 1.0** — `github` (REST + git-data-API workspace
+sync; `GITHUB_TOKEN`) and `supabase` (execute_sql, apply_migration,
+list_tables, list_projects; `SUPABASE_ACCESS_TOKEN` +
+`SUPABASE_PROJECT_REF`) — the same tool surface the 1.0 swarm exposes.
+
+**Clarification (ask the user)** — the chief's `ask_user` tool journals a
+`question` SSE event (the studio renders the interactive card) and parks
+until `POST /runs/:id/answer` (or timeout — the honest fallback instructs
+the chief to proceed with best judgment).
+
+**Keep-alive** — on Render, the engine self-pings its public `/health`
+every 10 min so the free tier never spins it down (the Uptime Robot
+"can't be reached" incident).
+
+### New/changed env
+
+| Var | Purpose |
+|---|---|
+| `GITHUB_TOKEN` | GitHub PAT for the github tool |
+| `SUPABASE_ACCESS_TOKEN` | sbp_ token for the supabase tool |
+| `SUPABASE_PROJECT_REF` | the bound project |
+| `ENGINE_JOURNAL_DIR` | where run JSONL histories land |
+| `KEEPALIVE_ENABLED` / `KEEPALIVE_INTERVAL_SECONDS` | self-ping guard |
+
+### Probes
+
+`probe/vube-e2e.mjs` — full local goal run: scaffold → judge loop →
+capability assertions. The other probes (kernel, tool, e2e-vm, debug)
+remain the pre-deploy gauntlet.
