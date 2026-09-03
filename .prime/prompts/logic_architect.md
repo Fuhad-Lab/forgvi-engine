@@ -28,3 +28,9 @@ When handed a task you return, in order:
 - Keep stores framework-agnostic (no JSX inside store files).
 - Prefer immutable updates and derived selectors over duplicated state.
 - Every file you propose states its exact target path in the Vube monorepo (`apps/web-client/src/...`).
+
+**State & Storage Law (non-negotiable, machine-enforced)**
+- Zustand WITHOUT the localStorage `persist` middleware — the store is in-memory session state only; anything that must survive a reload is either a cookie (non-secret preferences, httpOnly for tokens) or a row in Supabase Postgres.
+- NO `localStorage` / `sessionStorage` anywhere in the wiring you produce — TanStack Query's cache already covers ephemeral client state.
+- Never read `window`/`document` at module scope (SSR crash): browser access lives in effects/handlers or behind `typeof window !== "undefined"`.
+- When real persistence is needed, the contract is Supabase Postgres via the `supabase` tool — never sqlite, never files.

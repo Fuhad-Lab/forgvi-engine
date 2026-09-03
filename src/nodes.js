@@ -13,6 +13,7 @@ import { dispatchParallel, spawnSpecialistAgent } from "./orchestrator-utils.js"
 import { githubRest, githubSyncWorkspace, supabaseMcp } from "./mcp-tools.js";
 import { scaffoldVubeWorkspace } from "./scaffold.js";
 import { composeSpecialistPrompt, getPersona, listPersonas } from "./personas.js";
+import { runHardGates } from "./hard-gates.js";
 
 // ── persona nodes ─────────────────────────────────────────────────────
 registerNode({
@@ -157,4 +158,21 @@ registerNode({
     { name: "task", type: "string", required: true },
   ]),
   handler: async ({ persona, task }) => composeSpecialistPrompt(persona, task),
+});
+
+// ── verification nodes ────────────────────────────────────────────────
+registerNode({
+  id: "verify.hard_gates",
+  kind: "verification",
+  label: "Run the deterministic hard gates",
+  description:
+    "Run the machine-enforced production-readiness gates against the run's workspace: banned storage (localStorage/sessionStorage) scan, banned database (sqlite) scan, production build proof, and the dev-server port law. Gate failures make run completion impossible.",
+  schema: createSchema("verify.hard_gates", [
+    { name: "command", type: "string", required: false, description: "unused — gates run their fixed probe set" },
+  ]),
+  handler: async (_input, ctx) =>
+    runHardGates({
+      workspace: { vm: ctx?.vm ?? null, localCwd: ctx?.localCwd ?? null },
+      evidence: ctx?.evidence ?? [],
+    }),
 });

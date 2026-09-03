@@ -68,6 +68,10 @@ export function buildChiefTools(ctx) {
         journal,
         mailbox,
         iteration: run?.iteration,
+        // The debugger's terminal: terminal personas (qa_verifier) get a
+        // bash tool rooted at the run's own workspace — in-VM natively,
+        // VM-bound runs through the daytona-service, local runs on disk.
+        workspace: { vm: ctx.vm ?? null, localCwd: ctx.vm ? null : (ctx.localCwd ?? run?.localCwd ?? null) },
       });
       if (run) {
         for (const r of results) {

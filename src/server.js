@@ -334,22 +334,46 @@ const server = app.listen(PORT, "0.0.0.0", () => {
  * Robot's default 30s) which then report "can't be reached". Self-ping
  * the PUBLIC health endpoint (Render injects RENDER_EXTERNAL_URL) every
  * 10 minutes so the idle timer never expires. No-ops locally.
+ *
+ * 2026-09-04 — KEEP-ALIVE MESH (the "daytona service is still going down"
+ * incident): self-ping alone guards ONE service; if that service's own
+ * loop dies (restart, event-loop starvation, deploy race) nothing brings
+ * the idle timer back. The engine — the most reliable always-on Node
+ * service — now ALSO pings its two critical siblings on every cycle:
+ *   DAYTONA_KEEPALIVE_URL  (default arcforge-daytona /health) — the
+ *                          sandbox factory; a cold daytona = every new
+ *                          forge boot times out (the user-visible
+ *                          "daytona is down").
+ *   BACKEND_KEEPALIVE_URL  (default arcforge-backend /api/healthz) —
+ *                          auth + workspace grants.
+ * Inbound traffic through the public URL is inbound traffic regardless
+ * of who initiated it, so a sibling's ping is exactly as good as a
+ * self-ping — but now three independent loops cover each service.
  */
 function startKeepAlive() {
   const base = (process.env.RENDER_EXTERNAL_URL ?? "").replace(/\/+$/, "");
   const enabled = (process.env.KEEPALIVE_ENABLED ?? "1") !== "0";
   if (!enabled || !base) return;
   const intervalMs = Number(process.env.KEEPALIVE_INTERVAL_SECONDS ?? 600) * 1000;
-  const ping = async () => {
+  const siblings = [
+    process.env.DAYTONA_KEEPALIVE_URL ?? "https://arcforge-daytona.onrender.com/health",
+    process.env.BACKEND_KEEPALIVE_URL ?? "https://arcforge-backend.onrender.com/api/healthz",
+  ].filter(Boolean);
+  const ping = async (url) => {
     try {
-      const res = await fetch(`${base}/health`, { signal: AbortSignal.timeout(60_000) });
-      console.log(`[forgvi] keep-alive ping -> ${res.status}`);
+      const res = await fetch(url, { signal: AbortSignal.timeout(60_000) });
+      console.log(`[forgvi] keep-alive ping ${new URL(url).pathname} -> ${res.status}`);
     } catch (error) {
-      console.warn(`[forgvi] keep-alive ping failed (will retry): ${error?.message ?? error}`);
+      console.warn(`[forgvi] keep-alive ping failed (${url}): ${error?.message ?? error}`);
     }
   };
-  setTimeout(ping, 30_000).unref();
-  setInterval(ping, intervalMs).unref();
+  const cycle = () => {
+    void ping(`${base}/health`);
+    // Stagger sibling pings by 30s so a shared-rate-limited edge sees them separately.
+    siblings.forEach((url, i) => setTimeout(() => void ping(url), 30_000 * (i + 1)).unref?.());
+  };
+  setTimeout(cycle, 30_000).unref();
+  setInterval(cycle, intervalMs).unref();
 }
 
 const shutdown = () => {

@@ -90,13 +90,17 @@ class DeltaPump {
   }
 }
 
-/** Normalize + clamp the client-supplied budgets (the engine sets the ceiling). */
+/** Normalize + clamp the client-supplied budgets (the engine sets the ceiling).
+ * 2026-09-04: ceiling raised — one prompt → fully production-ready app is
+ * the mandate, and Nemotron Ultra 550B turns run 10-25 min each; the old
+ * 30-minute cap cut PROGRESSING runs mid-build. Default 45 min, hard
+ * ceiling 90 (matches the 1.0 ORCH_CONVERGE_MAX_S). */
 function normalizeBudgets(budgets) {
   const b = budgets ?? {};
   return {
-    maxIterations: clamp(Number(b.maxIterations) || 6, 1, 8),
-    wallClockMs: clamp(Number(b.wallClockMs) || 30 * 60_000, 60_000, 30 * 60_000),
-    tokenBudget: clamp(Number(b.tokenBudget) || 500_000, 10_000, 500_000),
+    maxIterations: clamp(Number(b.maxIterations) || 6, 1, 10),
+    wallClockMs: clamp(Number(b.wallClockMs) || 45 * 60_000, 60_000, 90 * 60_000),
+    tokenBudget: clamp(Number(b.tokenBudget) || 500_000, 10_000, 2_000_000),
   };
 }
 
@@ -547,7 +551,7 @@ export class RunManager {
 
         run.lastChiefReport = lastAssistantText(session);
 
-        // ── Verification turn (the independent judge) ─────────────────
+        // ── Verification turn (the independent judge + hard gates) ────
         journal.emit({ type: "role_spawned", role: "verifier" }, { role: "verifier", iteration });
         const verdict = await budgetGuard(
           verifyAcceptance({
@@ -555,6 +559,9 @@ export class RunManager {
             acceptance: run.acceptance,
             chiefReport: run.lastChiefReport,
             evidence: run.evidence,
+            // The hard gates execute real commands against the run's REAL
+            // workspace — the same backend the chief's own tools use.
+            workspace: { vm, localCwd: run.localCwd, inVm },
           }),
           null,
         );
@@ -575,6 +582,7 @@ export class RunManager {
             type: "verification_result",
             score: verdict.score,
             verdicts: verdict.verdicts,
+            hardGates: verdict.hardGates ?? [],
           },
           { iteration },
         );
@@ -728,6 +736,33 @@ function buildFirstPrompt(run) {
   ]
     .filter(Boolean)
     .join("\n");
+  // THE PRODUCTION-READINESS LAW — engine-level, defense in depth (it is
+  // law, not persona: it holds even if .prime/prompts/ is missing). The
+  // deterministic hard gates ENFORCE every clause (see hard-gates.js);
+  // violating any of them makes completion impossible, so the chief is
+  // told up front, in plain text, what the machine will check.
+  const lawBlock = [
+    "",
+    "THE PRODUCTION-READINESS LAW (machine-enforced — the verifier scans the",
+    "workspace with real commands; a violation makes completion impossible):",
+    "1. NO sqlite. NO localStorage. NO sessionStorage. NO flat-file or",
+    "   in-memory databases. The ONLY accepted persistence is a REAL database",
+    "   (Supabase Postgres via the supabase tool) or cookies (httpOnly,",
+    "   server-side). Zustand must run WITHOUT the localStorage persist",
+    "   middleware. Tokens/preferences go in cookies; data goes in Postgres.",
+    "2. SSR SAFETY: never touch window/document/localStorage at module scope",
+    "   or during render. Browser APIs live inside useEffect, event handlers,",
+    "   or a `typeof window !== \"undefined\"` guard. A server-rendered crash",
+    "   is a defect.",
+    "3. DEV SERVER DISCIPLINE: start dev servers with an explicit port flag —",
+    "   `npx next dev -p 3000` or `npm run dev -- -p 3000`. NEVER `next dev",
+    "   3000`: Next.js parses a bare number as a DIRECTORY, not a port, and",
+    "   the server dies. npm install ONCE before the first start.",
+    "4. BUILD PROOF: for every web app, `npm run build` (or `npx tsc",
+    "   --noEmit`) MUST exit 0 before you report completion. A dev server is",
+    "   NOT build proof. Fix every syntax, type, and SSR error the build",
+    "   surfaces, then re-run until it passes — the verifier checks for it.",
+  ].join("\n");
   if (run.workspace) {
     return [
       "You are the chief agent of a Forgvi 2.0 run. You operate inside the",
@@ -740,6 +775,7 @@ function buildFirstPrompt(run) {
       "first (ls, cat) and build on top rather than clobbering blindly.",
       "",
       vubeBlock,
+      lawBlock,
       "",
       "OBJECTIVE:",
       run.objective,
@@ -758,6 +794,7 @@ function buildFirstPrompt(run) {
     "every file you create is a real artifact on disk, and every command you run is real.",
     "",
     vubeBlock,
+    lawBlock,
     "",
     "OBJECTIVE:",
     run.objective,

@@ -145,7 +145,16 @@ export function buildVubeScaffold({ appName = "vube-app" } = {}) {
         name: `${safeName}-web-client`,
         version: "0.1.0",
         private: true,
-        scripts: { dev: "next dev", build: "next build", start: "next start", typecheck: "tsc --noEmit" },
+        scripts: {
+          // PORT LAW: always -p. A bare `next dev 3000` is parsed by Next.js
+          // as a DIRECTORY argument, not a port — the server dies with
+          // "Couldn't find a directory 3000". Baked into the scaffold so
+          // even a careless agent inherits the correct invocation.
+          dev: "next dev -p 3000",
+          build: "next build",
+          start: "next start -p 3000",
+          typecheck: "tsc --noEmit",
+        },
         dependencies: {
           "react": "^18.3.0",
           "react-dom": "^18.3.0",
