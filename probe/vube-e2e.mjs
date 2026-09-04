@@ -27,7 +27,6 @@ const started = await fetch(`${ENGINE}/runs`, {
   body: JSON.stringify({
     objective,
     acceptance,
-    budgets: { maxIterations: 3, wallClockMs: 9 * 60_000 },
   }),
 });
 if (!started.ok) {

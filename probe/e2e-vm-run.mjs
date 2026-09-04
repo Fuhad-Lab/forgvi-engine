@@ -45,7 +45,6 @@ const runRes = await fetch(`${ENGINE}/runs`, {
     objective:
       "Create the file /workspace/frontend/hello.html containing a minimal HTML page with an <h1> that says 'Hello from the VM workspace'. Then run `ls -la /workspace/frontend` and `cat /workspace/frontend/hello.html` to verify it exists, and report the verification.",
     acceptance: ["The file /workspace/frontend/hello.html exists in the workspace", "The page contains an h1 saying 'Hello from the VM workspace'"],
-    budgets: { maxIterations: 3, wallClockMs: 8 * 60_000, tokenBudget: 120_000 },
     workspaceGrant: grant,
   }),
 });
