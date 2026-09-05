@@ -55,6 +55,7 @@ import {
   createAgentSession,
   createBashTool,
   createEditTool,
+  DefaultResourceLoader,
   ModelRegistry,
   SessionManager,
   SettingsManager,
@@ -94,6 +95,36 @@ export const ENGINE_IN_VM = process.env.ENGINE_IN_VM === "1";
 
 /** Root the chief's tools at when running inside the VM. */
 const VM_WORKSPACE_ROOT = process.env.ENGINE_VM_WORKSPACE_ROOT ?? "/workspace";
+
+/**
+ * AUTHENTICATION POLICY — appended to the chief's SYSTEM PROMPT (user
+ * mandate: injected as a system prompt, never as hardcoded code paths).
+ * Binding rule for every Forgvi 2.0 run: apps that need authentication
+ * never use SQLite or browser web storage; only a real database (the
+ * user is asked which one when unspecified) and cookies.
+ */
+const AUTH_STORAGE_POLICY = [
+  "AUTHENTICATION POLICY (binding): if the app you are building needs authentication, it must NEVER use SQLite or localStorage. Only a real database is allowed — ask the user which database to use when it is not specified — and use cookies for sessions and tokens. Generated apps never use localStorage or sessionStorage for meaningful data: cookies and a real database are the industrial standard.",
+].join("\n");
+
+/** Build the chief's resource loader — the engine's single system-prompt
+ *  injection point. appendSystemPrompt is composed into the real system
+ *  prompt by prime-agent (see buildSystemPrompt), so the policy rides the
+ *  system layer, not the user turns. agentDir mirrors the kernel's own
+ *  .prime-agent config dir (auth.json / models.json live there). */
+async function createChiefResourceLoader(cwd) {
+  const loader = new DefaultResourceLoader({
+    cwd,
+    agentDir: resolve(ENGINE_DIR, ".prime-agent"),
+    settingsManager: SettingsManager.inMemory({
+      compaction: { enabled: false },
+      enableBuiltinSkills: false,
+    }),
+    appendSystemPrompt: [AUTH_STORAGE_POLICY],
+  });
+  await loader.reload();
+  return loader;
+}
 
 const ENGINE_DIR = resolve(new URL("..", import.meta.url).pathname);
 const MODELS_JSON = resolve(ENGINE_DIR, ".prime-agent", "models.json");
@@ -256,6 +287,7 @@ export async function createChiefSession({ runId, sessionId, workspace, interact
       authStorage: _auth,
       modelRegistry: _registry,
       cwd: vm.workspaceRoot,
+      resourceLoader: await createChiefResourceLoader(vm.workspaceRoot),
       sessionManager: SessionManager.inMemory(),
       settingsManager: SettingsManager.inMemory({
         compaction: { enabled: false },
@@ -298,6 +330,7 @@ export async function createChiefSession({ runId, sessionId, workspace, interact
     authStorage: _auth,
     modelRegistry: _registry,
     cwd,
+    resourceLoader: await createChiefResourceLoader(cwd),
     sessionManager: SessionManager.inMemory(),
     settingsManager: SettingsManager.inMemory({
       compaction: { enabled: false },
